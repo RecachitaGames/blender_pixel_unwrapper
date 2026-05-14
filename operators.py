@@ -416,14 +416,18 @@ class PIXUNWRAP_OT_swap_eraser(bpy.types.Operator):
     bl_label = "Toggle Erase Alpha"
     bl_options = {"UNDO"}
 
-    if bpy.app.version >= (4, 3, 0):
-        icon = "BRUSH_DATA"
-    else:
-        icon = "GPBRUSH_ERASE_HARD"
+    icon = "GPBRUSH_ERASE_HARD"
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.object.mode == "TEXTURE_PAINT"
+        brush = context.tool_settings.image_paint.brush
+        if brush is None:
+            return False
+        obj = context.active_object
+        if obj is not None and obj.mode == "TEXTURE_PAINT":
+            return True
+        sp = context.space_data
+        return sp is not None and sp.type == "IMAGE_EDITOR" and sp.mode == "PAINT"
 
     def execute(self, context):
         if not hasattr(self, "previous_blend"):
@@ -929,10 +933,7 @@ class PIXUNWRAP_OT_unwrap_single_pixel(bpy.types.Operator):
     bl_label = "Single Pixel (Fill)"
     bl_options = {"UNDO"}
 
-    if bpy.app.version >= (4, 3, 0):
-        icon = "CLIPUV_DEHLT"
-    else:
-        icon = "GPBRUSH_FILL"
+    icon = "STICKY_UVS_VERT"
 
     @classmethod
     def poll(cls, context):
@@ -1089,6 +1090,7 @@ class PIXUNWRAP_OT_uv_rot_90(bpy.types.Operator):
     bl_options = {"UNDO"}
 
     modify_texture: bpy.props.BoolProperty(default=False, name="Modify Texture")
+    clockwise: bpy.props.BoolProperty(default=False, name="Clockwise")
 
     @classmethod
     def poll(cls, context):
@@ -1117,7 +1119,8 @@ class PIXUNWRAP_OT_uv_rot_90(bpy.types.Operator):
 
             island_rect = island.calc_pixel_bounds(texture_size)
 
-            matrix = Matrix.Rotation(radians(90), 2).to_3x3()
+            angle = radians(-90 if self.clockwise else 90)
+            matrix = Matrix.Rotation(angle, 2).to_3x3()
             h = island_rect.size.y / 2
             pivot = Vector((island_rect.min.x + h, island_rect.min.y + h))
 
@@ -1621,4 +1624,320 @@ class PIXUNWRAP_OT_object_info(bpy.types.Operator):
         obj_names = ", ".join(ob.name for ob in objects_sharing_texture)
         self.report({"INFO"}, f"Used textures: [{tex_names}] Other objects: [{obj_names}]")
 
+        return {"FINISHED"}
+
+
+class PIXUNWRAP_OT_setup_pixel_snap(bpy.types.Operator):
+    """Enable pixel-corner snapping in the UV editor so UV islands snap to pixel boundaries when moved"""
+
+    bl_idname = "view3d.pixunwrap_setup_pixel_snap"
+    bl_label = "UV Pixel Snap"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        for area in context.screen.areas:
+            if area.type == "IMAGE_EDITOR":
+                for space in area.spaces:
+                    if space.type == "IMAGE_EDITOR":
+                        try:
+                            space.pixel_snap_mode = "CORNER"
+                        except AttributeError:
+                            pass
+
+        ts = context.scene.tool_settings
+        ts.use_snap = True
+        try:
+            ts.use_snap_uv_grid_absolute = True
+        except AttributeError:
+            pass
+
+        self.report({"INFO"}, "UV pixel snap enabled (corner mode)")
+        return {"FINISHED"}
+
+
+class PIXUNWRAP_OT_set_3d_pixel_grid(bpy.types.Operator):
+    """Set the 3D viewport grid and snap increment to match one pixel at the current Pixels Per Unit"""
+
+    bl_idname = "view3d.pixunwrap_set_3d_pixel_grid"
+    bl_label = "3D Grid = 1 Pixel"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        density = context.scene.pixunwrap_texel_density
+        if density <= 0:
+            self.report({"ERROR"}, "Pixels Per Unit must be greater than 0")
+            return {"CANCELLED"}
+
+        pixel_size = 1.0 / density
+
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        space.overlay.grid_scale = pixel_size
+                        space.overlay.grid_subdivisions = 1
+
+        ts = context.scene.tool_settings
+        ts.use_snap = True
+        try:
+            ts.snap_elements = {"INCREMENT"}
+        except (AttributeError, TypeError):
+            pass
+
+        self.report({"INFO"}, f"3D grid = {pixel_size:.4f} units/px ({density:.1f} px/unit). Snap enabled.")
+        return {"FINISHED"}
+
+
+class PIXUNWRAP_OT_setup_pixel_brush(bpy.types.Operator):
+    """Configure texture paint brush for pixel-perfect painting: 1 px size, full strength, no smoothing"""
+
+    bl_idname = "view3d.pixunwrap_setup_pixel_brush"
+    bl_label = "Pixel Pencil Setup"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        if context.tool_settings.image_paint.brush is None:
+            return False
+        obj = context.active_object
+        if obj is not None and obj.mode == "TEXTURE_PAINT":
+            return True
+        sp = context.space_data
+        return sp is not None and sp.type == "IMAGE_EDITOR" and sp.mode == "PAINT"
+
+    def execute(self, context):
+        brush = context.tool_settings.image_paint.brush
+
+        brush.size = 1
+        brush.use_pressure_size = False
+        brush.strength = 1.0
+        brush.use_pressure_strength = False
+        brush.jitter = 0.0
+        brush.use_smooth_stroke = False
+        brush.spacing = 1
+        brush.blend = "MIX"
+
+        self.report({"INFO"}, "Brush set to pixel-perfect (1 px, no smoothing, full strength)")
+        return {"FINISHED"}
+
+
+class PIXUNWRAP_OT_set_reference_edge(bpy.types.Operator):
+    """Set a reference edge for Object Grid mode: measures the selected edge and lets you define how many pixels it spans"""
+
+    bl_idname = "view3d.pixunwrap_set_reference_edge"
+    bl_label = "Set Reference Edge"
+    bl_options = {"REGISTER", "UNDO"}
+
+    pixels_for_edge: bpy.props.IntProperty(
+        name="Pixels for Edge",
+        default=8,
+        min=1,
+        max=4096,
+        description="How many pixels this edge should span in the texture",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        if obj is None:
+            return False
+        bm = bmesh.from_edit_mesh(obj.data)
+        return any(e.select for e in bm.edges)
+
+    def invoke(self, context, event):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected_edges = [e for e in bm.edges if e.select]
+        if selected_edges:
+            avg_length = sum(e.calc_length() for e in selected_edges) / len(selected_edges)
+            self.pixels_for_edge = max(1, round(avg_length * context.scene.pixunwrap_texel_density))
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected_edges = [e for e in bm.edges if e.select]
+
+        if not selected_edges:
+            self.report({"ERROR"}, "No edges selected")
+            return {"CANCELLED"}
+
+        avg_length = sum(e.calc_length() for e in selected_edges) / len(selected_edges)
+
+        if avg_length < 1e-6:
+            self.report({"ERROR"}, "Selected edge is too short")
+            return {"CANCELLED"}
+
+        context.scene.pixunwrap_ref_edge_length = avg_length
+        context.scene.pixunwrap_ref_edge_pixels = self.pixels_for_edge
+        context.scene.pixunwrap_grid_mode = "OBJECT"
+
+        new_density = self.pixels_for_edge / avg_length
+        context.scene.pixunwrap_texel_density = new_density
+
+        self.report(
+            {"INFO"},
+            f"Reference edge: {avg_length:.4f} units = {self.pixels_for_edge} px → {new_density:.2f} px/unit",
+        )
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# LIVE GRID UNWRAP — depsgraph handler + helpers
+# ---------------------------------------------------------------------------
+
+_live_unwrap_running = False
+_live_unwrap_vert_hash: dict = {}
+
+
+def _vert_positions_hash(obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    positions = tuple(
+        (round(v.co.x * 1e6), round(v.co.y * 1e6), round(v.co.z * 1e6))
+        for v in bm.verts
+    )
+    return hash(positions)
+
+
+def _do_live_grid_unwrap(scene, obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    uv_layer = bm.loops.layers.uv.verify()
+    selected_faces = [f for f in bm.faces if f.select]
+
+    if not selected_faces:
+        return
+
+    # Also include faces adjacent to selected faces (they get deformed when moving)
+    affected_verts = set()
+    for face in selected_faces:
+        for vert in face.verts:
+            affected_verts.add(vert)
+
+    # Find all faces that share vertices with selected faces
+    affected_faces = set(selected_faces)
+    for vert in affected_verts:
+        for face in vert.link_faces:
+            affected_faces.add(face)
+
+    target_density = scene.pixunwrap_texel_density
+    changed = False
+
+    for quad_group, connected_non_quads in zip(*find_quad_groups(list(affected_faces))):
+        try:
+            texture = get_texture_for_faces(obj, quad_group + connected_non_quads)
+            texture_size = (
+                texture.size[0] if texture is not None
+                else scene.pixunwrap_default_texture_size
+            )
+        except MultipleMaterialsError:
+            continue
+
+        try:
+            # Remember where the island currently is in pixel space
+            island = UVIsland(quad_group, bm, uv_layer)
+            old_min_px = Vector2Int(
+                round(island.min.x * texture_size),
+                round(island.min.y * texture_size),
+            )
+
+            # Re-run grid straightening (outputs grid starting at UV 0,0)
+            grid = Grid(bm, quad_group)
+            grid.straighten_uv(uv_layer, "ALL", texture_size, target_density)
+
+            # Translate back to original pixel position
+            offset = Vector((old_min_px.x / texture_size, old_min_px.y / texture_size))
+            uvs_translate_rotate_scale(quad_group, uv_layer, translate=offset)
+            uvs_pin(quad_group, uv_layer)
+            changed = True
+        except (GridBuildException, Exception):
+            continue
+
+    if changed:
+        bmesh.update_edit_mesh(obj.data)
+
+
+@bpy.app.handlers.persistent
+def live_unwrap_depsgraph_handler(scene, depsgraph):
+    """Handler that detects mesh changes via depsgraph updates"""
+    global _live_unwrap_running, _live_unwrap_vert_hash
+
+    if _live_unwrap_running:
+        return
+
+    if not getattr(scene, "pixunwrap_live_unwrap", False):
+        return
+
+    ctx = bpy.context
+    if not ctx or not ctx.active_object:
+        return
+
+    obj = ctx.active_object
+    if obj.type != "MESH" or obj.mode != "EDIT":
+        return
+
+    try:
+        new_hash = _vert_positions_hash(obj)
+        obj_name = obj.name
+
+        if _live_unwrap_vert_hash.get(obj_name) != new_hash:
+            _live_unwrap_vert_hash[obj_name] = new_hash
+            _live_unwrap_running = True
+            try:
+                _do_live_grid_unwrap(scene, obj)
+            except Exception:
+                pass
+            finally:
+                _live_unwrap_running = False
+    except Exception:
+        pass
+
+
+class PIXUNWRAP_OT_set_density_from_edge(bpy.types.Operator):
+    """Set Pixels Per Unit based on the world-space length of the selected edge"""
+
+    bl_idname = "view3d.pixunwrap_set_density_from_edge"
+    bl_label = "Set PPU from Edge"
+    bl_options = {"REGISTER", "UNDO"}
+
+    pixels_for_edge: bpy.props.IntProperty(
+        name="Pixels for Edge",
+        default=8,
+        min=1,
+        max=4096,
+        description="How many texture pixels this edge should span",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.edit_object
+        if obj is None:
+            return False
+        bm = bmesh.from_edit_mesh(obj.data)
+        return any(e.select for e in bm.edges)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        selected_edges = [e for e in bm.edges if e.select]
+
+        if not selected_edges:
+            self.report({"ERROR"}, "No edges selected")
+            return {"CANCELLED"}
+
+        avg_length = sum(e.calc_length() for e in selected_edges) / len(selected_edges)
+
+        if avg_length < 1e-6:
+            self.report({"ERROR"}, "Selected edge is too short")
+            return {"CANCELLED"}
+
+        new_density = self.pixels_for_edge / avg_length
+        context.scene.pixunwrap_texel_density = new_density
+
+        self.report(
+            {"INFO"},
+            f"Edge {avg_length:.4f} units = {self.pixels_for_edge} px → {new_density:.2f} px/unit",
+        )
         return {"FINISHED"}

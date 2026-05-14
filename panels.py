@@ -4,224 +4,272 @@ from .operators import *
 from .common import get_first_texture_on_object
 
 
-class PIXUNWRAP_PT_uv_tools(bpy.types.Panel):
-    """Pixel Unwrapper UV Operations Panel"""
+def _draw_texture_setup(self, context):
+    layout = self.layout
+    scene = context.scene
 
-    bl_label = "Pixel Unwrapper: UV Tools"
+    has_texture = (
+        context.view_layer.objects.active is not None
+        and get_first_texture_on_object(context.view_layer.objects.active) is not None
+    )
+
+    col = layout.column()
+
+    row = col.row(align=True)
+    row.operator("view3d.pixunwrap_create_texture", text="Create New")
+    row.operator("view3d.pixunwrap_duplicate_texture", text="Duplicate")
+
+    col.separator(factor=0.5)
+
+    row = col.row(align=True)
+    row.prop(scene, "pixunwrap_grid_mode", expand=True)
+
+    if scene.pixunwrap_grid_mode == "WORLD":
+        row = col.row(align=True)
+        row.prop(scene, "pixunwrap_texel_density")
+        row.operator("view3d.pixunwrap_set_density_from_edge", text="", icon="EDGESEL")
+    else:
+        if scene.pixunwrap_ref_edge_length > 1e-6:
+            derived = scene.pixunwrap_ref_edge_pixels / scene.pixunwrap_ref_edge_length
+            subcol = col.column(align=True)
+            row = subcol.row(align=True)
+            row.label(text=f"Edge: {scene.pixunwrap_ref_edge_length:.4f} u  =")
+            row.prop(scene, "pixunwrap_ref_edge_pixels", text="px")
+            subcol.label(text=f"→  {derived:.2f} px / unit", icon="INFO")
+        else:
+            col.label(text="No reference edge set yet", icon="ERROR")
+        col.operator("view3d.pixunwrap_set_reference_edge", icon="EDGESEL")
+
+    col.prop(scene, "pixunwrap_default_texture_size", text="Fallback Texture Size")
+
+    row = col.row(align=True)
+    row.enabled = has_texture
+    op = row.operator("view3d.pixunwrap_resize_texture", text="Double (×2)")
+    op.scale = 2
+    op = row.operator("view3d.pixunwrap_resize_texture", text="Halve (÷2)")
+    op.scale = 0.5
+
+    col.label(text="Fill Colors")
+    row = col.row(align=True)
+    row.prop(scene, "pixunwrap_texture_fill_color_tl", text="")
+    row.prop(scene, "pixunwrap_texture_fill_color_tr", text="")
+    row.prop(scene, "pixunwrap_texture_fill_color_bl", text="")
+    row.prop(scene, "pixunwrap_texture_fill_color_br", text="")
+
+
+def _draw_unwrapping(self, context):
+    layout = self.layout
+    scene = context.scene
+
+    if not scene.tool_settings.use_uv_select_sync:
+        row = layout.row()
+        row.alert = True
+        row.label(text='"UV Sync Selection" must be enabled', icon="ERROR")
+
+    col = layout.column(align=True)
+    col.scale_y = 1.5
+    col.operator("view3d.pixunwrap_unwrap_grid", icon="OUTLINER_OB_LATTICE")
+    col.operator("view3d.pixunwrap_unwrap_basic", icon="SELECT_SET")
+    col.operator(PIXUNWRAP_OT_unwrap_single_pixel.bl_idname)
+
+    col = layout.column(align=False)
+    col.scale_y = 1.5
+    col.operator("view3d.pixunwrap_hotspot", icon="MOD_UVPROJECT")
+
+    layout.prop(scene, "pixunwrap_live_unwrap", icon="FILE_REFRESH")
+
+
+def _draw_uv_editing(self, context):
+    layout = self.layout
+    scene = context.scene
+    modify_texture = scene.pixunwrap_modify_texture
+
+    row = layout.row()
+    row.scale_y = 1.4
+    row.prop(scene, "pixunwrap_modify_texture", icon="ERROR")
+
+    col = layout.column(align=True)
+    col.enabled = not modify_texture
+    col.operator("view3d.pixunwrap_set_uv_texel_density", icon="MOD_MESHDEFORM")
+    col.operator("view3d.pixunwrap_rectify", icon="MOD_BEVEL")
+
+    col = layout.column(align=True)
+    op = col.operator("view3d.pixunwrap_uv_flip", text="Flip Horizontal")
+    op.flip_axis = "X"
+    op.modify_texture = modify_texture
+    op = col.operator("view3d.pixunwrap_uv_flip", text="Flip Vertical")
+    op.flip_axis = "Y"
+    op.modify_texture = modify_texture
+
+    row = layout.row(align=True)
+    op = row.operator("view3d.pixunwrap_uv_rot_90", text="Rot 90° CCW")
+    op.modify_texture = modify_texture
+    op.clockwise = False
+    op = row.operator("view3d.pixunwrap_uv_rot_90", text="Rot 90° CW")
+    op.modify_texture = modify_texture
+    op.clockwise = True
+
+    fold_col = layout.column()
+    fold_col.enabled = not modify_texture
+    row = fold_col.row()
+    row.prop(scene, "pixunwrap_fold_sections", text="Folds")
+    row.prop(scene, "pixunwrap_fold_alternate", text="Mirror")
+    row = fold_col.row(align=True)
+    fold_x = row.operator("view3d.pixunwrap_uv_grid_fold", text="Fold X")
+    fold_x.x_sections = scene.pixunwrap_fold_sections
+    fold_x.y_sections = 1
+    fold_x.alternate = scene.pixunwrap_fold_alternate
+    fold_y = row.operator("view3d.pixunwrap_uv_grid_fold", text="Fold Y")
+    fold_y.x_sections = 1
+    fold_y.y_sections = scene.pixunwrap_fold_sections
+    fold_y.alternate = scene.pixunwrap_fold_alternate
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.enabled = not modify_texture
+    op = row.operator("view3d.pixunwrap_nudge_islands", icon="BACK", text="")
+    op.move_x = -1
+    op.move_y = 0
+    op = row.operator("view3d.pixunwrap_nudge_islands", icon="SORT_DESC", text="")
+    op.move_x = 0
+    op.move_y = 1
+    op = row.operator("view3d.pixunwrap_nudge_islands", icon="SORT_ASC", text="")
+    op.move_x = 0
+    op.move_y = -1
+    op = row.operator("view3d.pixunwrap_nudge_islands", icon="FORWARD", text="")
+    op.move_x = 1
+    op.move_y = 0
+    row.separator()
+    row.label(text="Nudge")
+
+    col = layout.column(align=True)
+    col.enabled = not modify_texture
+    col.operator("view3d.pixunwrap_stack_islands", icon="DUPLICATE")
+    col.operator("view3d.pixunwrap_randomize_islands", icon="PIVOT_BOUNDBOX")
+
+    col = layout.column(align=True)
+    op = col.operator("view3d.pixunwrap_island_to_free_space", icon="UV_ISLANDSEL")
+    op.modify_texture = modify_texture
+    op = col.operator("view3d.pixunwrap_repack_uvs", icon="ALIGN_BOTTOM")
+    op.modify_texture = modify_texture
+
+
+def _draw_texture_bake(self, context):
+    layout = self.layout
+    obj = context.active_object
+    buttonlabel = "Bake Texture"
+    if obj and len(obj.data.uv_layers) >= 2:
+        target_uv = obj.data.uv_layers.active
+        source_uv = next((uv for uv in obj.data.uv_layers if uv != target_uv), None)
+        texture_name = None
+        if obj.active_material and obj.active_material.use_nodes:
+            for node in obj.active_material.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and node.image:
+                    texture_name = node.image.name
+                    break
+        if source_uv and texture_name:
+            buttonlabel = f'Bake into "{texture_name}"'
+            layout.label(text=f"'{source_uv.name}' -> '{target_uv.name}'")
+    else:
+        layout.label(text="Select an object that has 2 UV maps")
+
+    layout.operator("view3d.pixunwrap_transfer_texture", text=buttonlabel)
+
+
+def _draw_paint_tools(self, context):
+    layout = self.layout
+    col = layout.column(align=True)
+    col.operator(PIXUNWRAP_OT_swap_eraser.bl_idname)
+    col.operator("view3d.pixunwrap_setup_pixel_brush", icon="SNAP_ON")
+
+
+# ---------------------------------------------------------------------------
+# VIEW_3D panels
+# ---------------------------------------------------------------------------
+
+class PIXUNWRAP_PT_texture_setup(bpy.types.Panel):
+    bl_label = "Texture Setup"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Pixel Unwrapper"
-
-    def draw(self, context):
-        # addon_prefs = prefs()
-        layout = self.layout
-
-        #  __   __ ___       __
-        # (__' |__  |  |  | |__)
-        # .__) |__  |  \__/ |
-        #
-        box = layout.box()
-        header = box.row()
-        header.label(text="Texture Setup")
-        header.operator("view3d.pixunwrap_object_info", text="", icon="QUESTION")
-
-        content = box.column()
-
-        has_texture = (
-            context.view_layer.objects.active is not None
-            and get_first_texture_on_object(context.view_layer.objects.active) is not None
-        )
-
-        can_create_texture = context.view_layer.objects.active is not None and not has_texture
-
-        row = content.row(align=True)
-        # col.enabled = can_create_texture
-        row.operator("view3d.pixunwrap_create_texture", text="Create New")
-        row.operator("view3d.pixunwrap_duplicate_texture", text="Duplicate")
-
-        content.prop(context.scene, "pixunwrap_texel_density")
-        content.prop(context.scene, "pixunwrap_default_texture_size")
-
-        # row = col.row(align=True)
-        # row.operator("view3d.pixunwrap_detect_texture_size", text="", icon="EYEDROPPER")
-
-        row = content.row(align=True)
-        row.enabled = has_texture
-        op = row.operator("view3d.pixunwrap_resize_texture", text="Double (×2)")
-        op.scale = 2
-        op = row.operator("view3d.pixunwrap_resize_texture", text="Halve (÷2)")
-        op.scale = 0.5
-
-        content.label(text="Fill Colors")
-        row = content.row(align=True)
-        row.prop(context.scene, "pixunwrap_texture_fill_color_tl", text="")
-        row.prop(context.scene, "pixunwrap_texture_fill_color_tr", text="")
-        row.prop(context.scene, "pixunwrap_texture_fill_color_bl", text="")
-        row.prop(context.scene, "pixunwrap_texture_fill_color_br", text="")
-
-        # row = col.row(align=True)
-
-        #                     __    _    __   __          __
-        # |  | |\ | |  /\  | |__)  /_\  |__) |__) | |\ | / __
-        # \__/ | \|  \/  \/  |  \ /   \ |    |    | | \| \__|
-        #
-        box = layout.box()
-        box.label(text="Unwrapping")
-
-        # Add UV sync warning
-        if not context.scene.tool_settings.use_uv_select_sync:
-            warning = box.row()
-            warning.alert = True  # Makes the text red
-            warning.label(text='"UV Sync Selection" must be enabled', icon="ERROR")
-
-        col = box.column(align=True)
-        col.scale_y = 1.5
-        col.operator("view3d.pixunwrap_unwrap_grid", icon="OUTLINER_OB_LATTICE")
-        col.operator("view3d.pixunwrap_unwrap_basic", icon="SELECT_SET")
-        # col.operator("view3d.pixunwrap_unwrap_extend", icon="SELECT_SUBTRACT")
-        col.operator(PIXUNWRAP_OT_unwrap_single_pixel.bl_idname, icon=PIXUNWRAP_OT_unwrap_single_pixel.icon)
-
-        col = box.column(align=False)
-        col.scale_y = 1.5
-        col.operator("view3d.pixunwrap_hotspot", icon="MOD_UVPROJECT")
-
-        #  __  __    ___               __
-        # |__ |  \ |  |     |  | \  / (__'
-        # |__ |__/ |  |     \__/  \/  .__)
-        #
-        box = layout.box()
-
-        header = box.row()
-        header.label(text="UV Editing")
-
-        # Option 2: Bigger toggle with warning colors
-        row = box.row()
-        row.scale_y = 1.4  # Makes it bigger
-        # row.alert = True  # Red warning color
-        row.prop(context.scene, "pixunwrap_modify_texture", icon="ERROR")  # or ERROR/WARNING icon
-
-        modify_texture = context.scene.pixunwrap_modify_texture
-
-        col = box.column(align=True)
-        col.enabled = not modify_texture
-        col.operator("view3d.pixunwrap_set_uv_texel_density", icon="MOD_MESHDEFORM")
-        col.operator("view3d.pixunwrap_rectify", icon="MOD_BEVEL")
-
-        ###################
-        # FLIP AND ROTATE #
-        ###################
-        col = box.column(align=True)
-        op = col.operator("view3d.pixunwrap_uv_flip", text="Flip Horizontal")
-        op.flip_axis = "X"
-        op.modify_texture = modify_texture
-
-        op = col.operator("view3d.pixunwrap_uv_flip", text="Flip Vertical")
-        op.flip_axis = "Y"
-        op.modify_texture = modify_texture
-
-        op = col.operator("view3d.pixunwrap_uv_rot_90", text="Rotate 90° CCW")
-        op.modify_texture = modify_texture
-
-        ###########
-        # FOLDING #
-        ###########
-        fold_box = box.column()
-        fold_box.enabled = not modify_texture
-        fold_content = fold_box.column()
-        row = fold_content.row()
-        row.prop(context.scene, "pixunwrap_fold_sections", text="Folds")
-        row.prop(context.scene, "pixunwrap_fold_alternate", text="Mirror")
-        # fold_content.separator()
-        row = fold_content.row(align=True)
-
-        fold_x = row.operator("view3d.pixunwrap_uv_grid_fold", text="Fold X")
-        fold_x.x_sections = context.scene.pixunwrap_fold_sections
-        fold_x.y_sections = 1
-        fold_x.alternate = context.scene.pixunwrap_fold_alternate
-
-        fold_y = row.operator("view3d.pixunwrap_uv_grid_fold", text="Fold Y")
-        fold_y.x_sections = 1
-        fold_y.y_sections = context.scene.pixunwrap_fold_sections
-        fold_y.alternate = context.scene.pixunwrap_fold_alternate
-
-        ######################
-        # OTHER UV OPERATORS #
-        ######################
-        # These operators can NEVER preserve texturing
+    bl_options = {"DEFAULT_CLOSED"}
+    draw = _draw_texture_setup
 
 
-        col =box.column(align=True)
-        row = col.row(align=True)
-        row.enabled = not modify_texture
-        op = row.operator("view3d.pixunwrap_nudge_islands", icon="BACK", text="")
-        op.move_x = -1
-        op.move_y = 0
-        op = row.operator("view3d.pixunwrap_nudge_islands", icon="SORT_DESC", text="")
-        op.move_x = 0
-        op.move_y = 1
-        op = row.operator("view3d.pixunwrap_nudge_islands", icon="SORT_ASC", text="")
-        op.move_x = 0
-        op.move_y = -1
-        op = row.operator("view3d.pixunwrap_nudge_islands", icon="FORWARD", text="")
-        op.move_x = 1
-        op.move_y = 0
-        row.separator()
-        row.label(text="Nudge")
-
-        col = box.column(align = True)
-        col.enabled = not modify_texture
-        col.operator("view3d.pixunwrap_stack_islands", icon="DUPLICATE")
-        col.operator("view3d.pixunwrap_randomize_islands", icon="PIVOT_BOUNDBOX")
+class PIXUNWRAP_PT_unwrapping(bpy.types.Panel):
+    bl_label = "Unwrapping"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    draw = _draw_unwrapping
 
 
-        col = box.column(align=True)
-        op = col.operator("view3d.pixunwrap_island_to_free_space", icon="UV_ISLANDSEL")
-        op.modify_texture = modify_texture
+class PIXUNWRAP_PT_uv_editing(bpy.types.Panel):
+    bl_label = "UV Editing"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    draw = _draw_uv_editing
 
-        op = col.operator("view3d.pixunwrap_repack_uvs", icon="ALIGN_BOTTOM")
-        op.modify_texture = modify_texture
 
-        # ___  __     ___       __   __     __    _        __
-        #  |  |__ \_/  |  |  | |__) |__    |__)  /_\  |_/ |__
-        #  |  |__ / \  |  \__/ |  \ |__    |__) /   \ | \ |__
-        #
-        box = layout.box()
-        header = box.row()
-        header.label(text="Texture Bake")
-        obj = context.active_object
-        buttonlabel = "Bake Texture"
-        if obj and len(obj.data.uv_layers) >= 2:
-            target_uv = obj.data.uv_layers.active
-            source_uv = next((uv for uv in obj.data.uv_layers if uv != target_uv), None)
-            # Find texture name
-            texture_name = None
-            if obj.active_material and obj.active_material.use_nodes:
-                for node in obj.active_material.node_tree.nodes:
-                    if node.type == "TEX_IMAGE" and node.image:
-                        texture_name = node.image.name
-                        break
-            if source_uv and texture_name:
-                buttonlabel = f'Bake into "{texture_name}"'
-                box.label(text=f"'{source_uv.name}' -> '{target_uv.name}'")
-        else:
-            box.label(text="Select an object that has 2 UV maps")
-
-        box.operator("view3d.pixunwrap_transfer_texture", text=buttonlabel)
+class PIXUNWRAP_PT_texture_bake(bpy.types.Panel):
+    bl_label = "Texture Bake"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    bl_options = {"DEFAULT_CLOSED"}
+    draw = _draw_texture_bake
 
 
 class PIXUNWRAP_PT_paint_tools(bpy.types.Panel):
-    """Pixel Unwrapper Texture Painting Panel"""
-
-    bl_label = "Pixel Unwrapper: Paint Tools"
+    bl_label = "Paint Tools"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Pixel Unwrapper"
+    draw = _draw_paint_tools
 
-    def draw(self, context):
-        # addon_prefs = prefs()
-        layout = self.layout
 
-        box = layout.box()
-        box.label(text="Texture Paint Tools")
-        col = box.column(align=True)
-        col.operator(PIXUNWRAP_OT_swap_eraser.bl_idname, icon=PIXUNWRAP_OT_swap_eraser.icon)
+# ---------------------------------------------------------------------------
+# IMAGE_EDITOR panels
+# ---------------------------------------------------------------------------
+
+class PIXUNWRAP_PT_texture_setup_ie(bpy.types.Panel):
+    bl_label = "Texture Setup"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    bl_options = {"DEFAULT_CLOSED"}
+    draw = _draw_texture_setup
+
+
+class PIXUNWRAP_PT_unwrapping_ie(bpy.types.Panel):
+    bl_label = "Unwrapping"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    draw = _draw_unwrapping
+
+
+class PIXUNWRAP_PT_uv_editing_ie(bpy.types.Panel):
+    bl_label = "UV Editing"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    draw = _draw_uv_editing
+
+
+class PIXUNWRAP_PT_texture_bake_ie(bpy.types.Panel):
+    bl_label = "Texture Bake"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    bl_options = {"DEFAULT_CLOSED"}
+    draw = _draw_texture_bake
+
+
+class PIXUNWRAP_PT_paint_tools_ie(bpy.types.Panel):
+    bl_label = "Paint Tools"
+    bl_space_type = "IMAGE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Pixel Unwrapper"
+    draw = _draw_paint_tools
