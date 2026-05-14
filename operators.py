@@ -1788,6 +1788,8 @@ class PIXUNWRAP_OT_set_reference_edge(bpy.types.Operator):
 
 _live_unwrap_running = False
 _live_unwrap_vert_hash: dict = {}
+_live_unwrap_face_geometry: dict = {}  # {obj_name: {face_index: edge_lengths}}
+_live_unwrap_last_active_obj = None  # Track active object to detect changes
 
 
 def _vert_positions_hash(obj):
@@ -1799,59 +1801,196 @@ def _vert_positions_hash(obj):
     return hash(positions)
 
 
+def _get_face_edge_lengths(face):
+    """Get sorted edge lengths of a face (invariant to translation/rotation)"""
+    edges = []
+    for edge in face.edges:
+        length = edge.calc_length()
+        edges.append(round(length * 1e6))
+    return tuple(sorted(edges))
+
+
+def _get_all_faces_geometry(bm):
+    """Return dict of {face_index: edge_lengths_tuple}"""
+    return {f.index: _get_face_edge_lengths(f) for f in bm.faces}
+
+
+def _get_modified_faces(bm, old_geometry_dict):
+    """Return set of face indices that were deformed (shape changed, not just translated)"""
+    obj_name = getattr(bm, "_pixunwrap_obj_name", "unknown")
+
+    if obj_name not in old_geometry_dict:
+        # No old geometry data (first run), all faces are considered modified
+        return {f.index for f in bm.faces}
+
+    old_geo = old_geometry_dict[obj_name]
+    modified = set()
+
+    for face in bm.faces:
+        old_edges = old_geo.get(face.index)
+        if old_edges is None:
+            continue  # New face, skip
+
+        new_edges = _get_face_edge_lengths(face)
+        if old_edges != new_edges:
+            # Face geometry changed (deformed)
+            modified.add(face.index)
+
+    return modified
+
+
+def _island_has_modified_face(island, modified_face_indices):
+    """Check if an island contains any deformed faces"""
+    for face in island.get_faces():
+        if face.index in modified_face_indices:
+            return True
+    return False
+
+
+def _save_island_uv_state(island, texture_size):
+    """Save UV state of an island: min position in pixel space"""
+    island.update_min_max()
+    return Vector2Int(
+        round(island.min.x * texture_size),
+        round(island.min.y * texture_size),
+    )
+
+
+def _restore_island_uv_position(island_faces, old_px_pos, new_px_pos, texture_size, uv_layer):
+    """Restore island to its original UV pixel position after recalculation"""
+    offset = (old_px_pos - new_px_pos) / texture_size
+    uvs_translate_rotate_scale(island_faces, uv_layer, translate=offset)
+
+
+def _face_edge_lengths_changed(face, old_geo, tolerance):
+    """True if face edge lengths differ from baseline beyond tolerance."""
+    old_edges = old_geo.get(face.index)
+    if old_edges is None:
+        return False
+    new_edges = _get_face_edge_lengths(face)
+    if len(new_edges) != len(old_edges):
+        return True
+    return any(abs(n - o) > tolerance for n, o in zip(new_edges, old_edges))
+
+
 def _do_live_grid_unwrap(scene, obj):
+    global _live_unwrap_face_geometry
+
     bm = bmesh.from_edit_mesh(obj.data)
     uv_layer = bm.loops.layers.uv.verify()
+
+    # Face select mode: f.select is authoritative.
+    # Vertex/edge select mode: fall back to faces where ALL verts are selected.
     selected_faces = [f for f in bm.faces if f.select]
+    if not selected_faces:
+        selected_faces = [f for f in bm.faces if f.verts and all(v.select for v in f.verts)]
+
+    print(f"[LiveUnwrap] obj={obj.name} selected={len(selected_faces)} total={len(bm.faces)}")
 
     if not selected_faces:
+        print("[LiveUnwrap] No selected faces — abort")
         return
 
-    # Also include faces adjacent to selected faces (they get deformed when moving)
-    affected_verts = set()
-    for face in selected_faces:
-        for vert in face.verts:
-            affected_verts.add(vert)
+    obj_geo = _live_unwrap_face_geometry.get(obj.name)
+    if obj_geo is None:
+        print("[LiveUnwrap] No baseline — abort (will be saved by handler)")
+        return
 
-    # Find all faces that share vertices with selected faces
+    # Tolerance: 1% of a pixel in world space, expressed in our 1e6 integer scale.
+    # Filters float noise from rigid translations/rotations, but detects real deformations.
+    pixels_per_unit = max(scene.pixunwrap_texel_density, 1.0)
+    pixel_world = 1.0 / pixels_per_unit          # world-space size of one pixel
+    tolerance = int(pixel_world * 0.01 * 1e6)    # 1% of a pixel
+    tolerance = max(tolerance, 10)               # never below 10 µm
+
+    modified_face_indices = {
+        f.index for f in bm.faces
+        if _face_edge_lengths_changed(f, obj_geo, tolerance)
+    }
+
+    print(f"[LiveUnwrap] tolerance={tolerance}, modified_faces={modified_face_indices}")
+
+    if not modified_face_indices:
+        print("[LiveUnwrap] No deformed faces — nothing to do")
+        return
+
+    # Affected = selected faces + their immediate face-neighbours (they deform when
+    # the selected face moves).
     affected_faces = set(selected_faces)
-    for vert in affected_verts:
-        for face in vert.link_faces:
-            affected_faces.add(face)
+    for face in list(selected_faces):
+        for vert in face.verts:
+            for linked in vert.link_faces:
+                affected_faces.add(linked)
+
+    print(f"[LiveUnwrap] affected_faces={len(affected_faces)}")
 
     target_density = scene.pixunwrap_texel_density
     changed = False
 
-    for quad_group, connected_non_quads in zip(*find_quad_groups(list(affected_faces))):
-        try:
-            texture = get_texture_for_faces(obj, quad_group + connected_non_quads)
-            texture_size = (
-                texture.size[0] if texture is not None
-                else scene.pixunwrap_default_texture_size
-            )
-        except MultipleMaterialsError:
+    groups_result = find_quad_groups(list(affected_faces))
+    print(f"[LiveUnwrap] quad groups={len(groups_result[0])}")
+
+    for quad_group, connected_non_quads in zip(*groups_result):
+        all_in_group = quad_group + connected_non_quads
+        has_modified = any(f.index in modified_face_indices for f in all_in_group)
+        print(f"[LiveUnwrap] group quads={len(quad_group)} non_quads={len(connected_non_quads)} has_modified={has_modified}")
+
+        if not has_modified:
             continue
 
         try:
-            # Remember where the island currently is in pixel space
-            island = UVIsland(quad_group, bm, uv_layer)
-            old_min_px = Vector2Int(
-                round(island.min.x * texture_size),
-                round(island.min.y * texture_size),
-            )
+            texture = get_texture_for_faces(obj, all_in_group)
+            texture_size = texture.size[0] if texture is not None else scene.pixunwrap_default_texture_size
+        except MultipleMaterialsError as e:
+            print(f"[LiveUnwrap] MultipleMaterialsError: {e}")
+            continue
 
-            # Re-run grid straightening (outputs grid starting at UV 0,0)
+        try:
+            # Check if there are any modified quads in this group — if all quads
+            # are unmodified we can skip this group entirely.
+            has_modified_quads = any(f.index in modified_face_indices for f in quad_group)
+            if not has_modified_quads:
+                print("[LiveUnwrap] No modified quads — skip rebuild")
+                continue
+
+            # Save UV loop data (per-loop UV coords + pin flag) for every
+            # unmodified face BEFORE the grid rebuild destroys the island layout.
+            # grid.straighten_uv collapses all quads into one flat island, so
+            # island-level save/restore doesn't work; we operate at loop level.
+            saved_loop_uvs = {}  # face_index -> [(uv_copy, pin_flag), ...]
+            for face in quad_group:
+                if face.index not in modified_face_indices:
+                    saved_loop_uvs[face.index] = [
+                        (loop[uv_layer].uv.copy(), loop[uv_layer].pin_uv)
+                        for loop in face.loops
+                    ]
+
+            unmodified_count = len(saved_loop_uvs)
+            print(f"[LiveUnwrap] unmodified_faces={unmodified_count}/{len(quad_group)}")
+
             grid = Grid(bm, quad_group)
             grid.straighten_uv(uv_layer, "ALL", texture_size, target_density)
 
-            # Translate back to original pixel position
-            offset = Vector((old_min_px.x / texture_size, old_min_px.y / texture_size))
-            uvs_translate_rotate_scale(quad_group, uv_layer, translate=offset)
+            # Restore exact UV coords for faces that didn't change shape.
+            for face in quad_group:
+                if face.index in saved_loop_uvs:
+                    for loop, (uv, pin) in zip(face.loops, saved_loop_uvs[face.index]):
+                        loop[uv_layer].uv = uv
+                        loop[uv_layer].pin_uv = pin
+
             uvs_pin(quad_group, uv_layer)
             changed = True
-        except (GridBuildException, Exception):
+            print("[LiveUnwrap] Grid rebuilt OK")
+        except GridBuildException as e:
+            print(f"[LiveUnwrap] GridBuildException: {e}")
+            continue
+        except Exception as e:
+            print(f"[LiveUnwrap] Exception: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
+    print(f"[LiveUnwrap] Done changed={changed}")
     if changed:
         bmesh.update_edit_mesh(obj.data)
 
@@ -1859,7 +1998,7 @@ def _do_live_grid_unwrap(scene, obj):
 @bpy.app.handlers.persistent
 def live_unwrap_depsgraph_handler(scene, depsgraph):
     """Handler that detects mesh changes via depsgraph updates"""
-    global _live_unwrap_running, _live_unwrap_vert_hash
+    global _live_unwrap_running, _live_unwrap_vert_hash, _live_unwrap_face_geometry, _live_unwrap_last_active_obj
 
     if _live_unwrap_running:
         return
@@ -1875,21 +2014,38 @@ def live_unwrap_depsgraph_handler(scene, depsgraph):
     if obj.type != "MESH" or obj.mode != "EDIT":
         return
 
+    obj_name = obj.name
+
+    # Initialize geometry baseline for new/changed active object
+    if _live_unwrap_last_active_obj != obj_name:
+        _live_unwrap_last_active_obj = obj_name
+        if obj_name not in _live_unwrap_face_geometry:
+            try:
+                bm = bmesh.from_edit_mesh(obj.data)
+                _live_unwrap_face_geometry[obj_name] = _get_all_faces_geometry(bm)
+                print(f"[LiveUnwrap] Initialized baseline for {obj_name}")
+            except Exception as e:
+                print(f"[LiveUnwrap] Error initializing baseline: {e}")
+        return
+
     try:
         new_hash = _vert_positions_hash(obj)
-        obj_name = obj.name
+        old_hash = _live_unwrap_vert_hash.get(obj_name)
 
-        if _live_unwrap_vert_hash.get(obj_name) != new_hash:
+        if old_hash != new_hash:
+            print(f"[LiveUnwrap] Hash changed for {obj_name}: {old_hash} -> {new_hash}")
             _live_unwrap_vert_hash[obj_name] = new_hash
             _live_unwrap_running = True
             try:
                 _do_live_grid_unwrap(scene, obj)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[LiveUnwrap] Unhandled exception in _do_live_grid_unwrap: {type(e).__name__}: {e}")
             finally:
+                bm = bmesh.from_edit_mesh(obj.data)
+                _live_unwrap_face_geometry[obj_name] = _get_all_faces_geometry(bm)
                 _live_unwrap_running = False
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[LiveUnwrap] Exception in handler: {type(e).__name__}: {e}")
 
 
 class PIXUNWRAP_OT_set_density_from_edge(bpy.types.Operator):

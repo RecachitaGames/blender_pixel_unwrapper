@@ -59,7 +59,17 @@ def _update_texel_density(self, context):
 
 
 def _update_live_unwrap(self, context):
-    pass
+    """Initialize face geometry snapshot when Live Unwrap is activated"""
+    if self.pixunwrap_live_unwrap:
+        obj = context.active_object
+        if obj and obj.type == "MESH" and obj.mode == "EDIT":
+            try:
+                from .operators import _live_unwrap_face_geometry, _get_all_faces_geometry
+                import bmesh
+                bm = bmesh.from_edit_mesh(obj.data)
+                _live_unwrap_face_geometry[obj.name] = _get_all_faces_geometry(bm)
+            except Exception:
+                pass
 
 
 @bpy.app.handlers.persistent
