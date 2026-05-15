@@ -1946,37 +1946,63 @@ def _do_live_grid_unwrap(scene, obj):
             continue
 
         try:
-            # Check if there are any modified quads in this group — if all quads
-            # are unmodified we can skip this group entirely.
             has_modified_quads = any(f.index in modified_face_indices for f in quad_group)
             if not has_modified_quads:
                 print("[LiveUnwrap] No modified quads — skip rebuild")
                 continue
 
-            # Save UV loop data (per-loop UV coords + pin flag) for every
-            # unmodified face BEFORE the grid rebuild destroys the island layout.
-            # grid.straighten_uv collapses all quads into one flat island, so
-            # island-level save/restore doesn't work; we operate at loop level.
-            saved_loop_uvs = {}  # face_index -> [(uv_copy, pin_flag), ...]
+            # ── Before rebuild ──────────────────────────────────────────────
+            # Unmodified faces: save exact loop UV data to restore later.
+            # Modified faces: save min-corner pixel position so we can
+            #   translate the new UV shape back to the original location.
+            saved_loop_uvs = {}       # face_index -> [(uv_copy, pin), ...]
+            old_min_corner_px = {}    # face_index -> (px_u, px_v)
+
             for face in quad_group:
+                loops_uv = [loop[uv_layer].uv for loop in face.loops]
                 if face.index not in modified_face_indices:
                     saved_loop_uvs[face.index] = [
-                        (loop[uv_layer].uv.copy(), loop[uv_layer].pin_uv)
-                        for loop in face.loops
+                        (uv.copy(), loop[uv_layer].pin_uv)
+                        for uv, loop in zip(loops_uv, face.loops)
                     ]
+                else:
+                    min_u = min(uv.x for uv in loops_uv)
+                    min_v = min(uv.y for uv in loops_uv)
+                    old_min_corner_px[face.index] = (
+                        round(min_u * texture_size),
+                        round(min_v * texture_size),
+                    )
 
-            unmodified_count = len(saved_loop_uvs)
-            print(f"[LiveUnwrap] unmodified_faces={unmodified_count}/{len(quad_group)}")
+            print(f"[LiveUnwrap] unmodified={len(saved_loop_uvs)} modified={len(old_min_corner_px)}")
 
+            # ── Rebuild ──────────────────────────────────────────────────────
             grid = Grid(bm, quad_group)
             grid.straighten_uv(uv_layer, "ALL", texture_size, target_density)
 
-            # Restore exact UV coords for faces that didn't change shape.
+            # ── After rebuild ────────────────────────────────────────────────
+            # 1. Restore exact UVs for unmodified faces.
             for face in quad_group:
                 if face.index in saved_loop_uvs:
                     for loop, (uv, pin) in zip(face.loops, saved_loop_uvs[face.index]):
                         loop[uv_layer].uv = uv
                         loop[uv_layer].pin_uv = pin
+
+            # 2. For each modified face, translate its new UV shape back to the
+            #    original pixel position (integer-pixel offset).
+            #    Processing faces independently re-creates separate UV islands.
+            for face in quad_group:
+                if face.index not in old_min_corner_px:
+                    continue
+                old_pu, old_pv = old_min_corner_px[face.index]
+                loops_uv = [loop[uv_layer].uv for loop in face.loops]
+                new_pu = round(min(uv.x for uv in loops_uv) * texture_size)
+                new_pv = round(min(uv.y for uv in loops_uv) * texture_size)
+                du = (old_pu - new_pu) / texture_size
+                dv = (old_pv - new_pv) / texture_size
+                if du != 0.0 or dv != 0.0:
+                    for loop in face.loops:
+                        uv = loop[uv_layer].uv
+                        loop[uv_layer].uv = Vector((uv.x + du, uv.y + dv))
 
             uvs_pin(quad_group, uv_layer)
             changed = True
